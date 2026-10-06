@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'terrafrom-test-dev-file' }}
   STATE_REGION: us-east-1
 
 jobs:
