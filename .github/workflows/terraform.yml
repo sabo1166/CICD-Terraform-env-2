@@ -12,23 +12,54 @@ permissions:
 
 env:
   STATE_BUCKET: ${{ vars.TF_STATE_BUCKET || 'terrafrom-test-dev-file' }}
+  # The S3 state bucket lives in us-east-1 for BOTH environments
   STATE_REGION: us-east-1
 
 jobs:
-  terraform-init:
-    name: terraform-init (${{ matrix.env }})
+  validate:
+    name: validate
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - env: dev
-            region: us-east-1
-          - env: test
-            region: eu-west-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Diagnostics
+        run: |
+          echo "===== STAGE ====="
+          echo "validate (no backend, no state access)"
+          echo "===== TERRAFORM VERSION ====="
+          terraform version
+          echo "===== WORKING DIRECTORY ====="
+          pwd
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init (no backend)
+        run: |
+          for env in dev test; do
+            echo "===== init -backend=false: $env ====="
+            terraform -chdir=environments/$env init -backend=false -input=false
+          done
+
+      - name: Terraform Validate
+        run: |
+          for env in dev test; do
+            echo "===== validate: $env ====="
+            terraform -chdir=environments/$env validate
+          done
+
+  dev-init:
+    name: dev-init
+    needs: validate
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
     defaults:
       run:
-        working-directory: environments/${{ matrix.env }}
+        working-directory: environments/dev
     steps:
       - uses: actions/checkout@v4
 
@@ -38,13 +69,28 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ matrix.region }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Diagnostics
+        run: |
+          echo "===== ENVIRONMENT ====="
+          echo "Dev"
+          echo "===== STAGE ====="
+          echo "dev-init"
+          echo "===== AWS REGION ====="
+          echo "$AWS_REGION"
+          echo "===== BACKEND ====="
+          echo "bucket=$STATE_BUCKET key=dev/terraform.tfstate region=$STATE_REGION"
+          echo "===== TERRAFORM VERSION ====="
+          terraform version
+          echo "===== WORKING DIRECTORY ====="
+          pwd
 
       - name: Terraform Init
         run: >
           terraform init -input=false
           -backend-config="bucket=${STATE_BUCKET}"
-          -backend-config="key=${{ matrix.env }}/terraform.tfstate"
+          -backend-config="key=dev/terraform.tfstate"
           -backend-config="region=${STATE_REGION}"
 
       # tar keeps the provider binaries' executable bit, which artifact zips drop
@@ -54,25 +100,20 @@ jobs:
       - name: Upload init artifact
         uses: actions/upload-artifact@v4
         with:
-          name: init-${{ matrix.env }}
-          path: environments/${{ matrix.env }}/init.tar
+          name: dev-init
+          path: environments/dev/init.tar
           retention-days: 1
 
-  terraform-plan:
-    name: terraform-plan (${{ matrix.env }})
-    needs: terraform-init
+  dev-plan:
+    name: dev-plan
+    needs: dev-init
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - env: dev
-            region: us-east-1
-          - env: test
-            region: eu-west-1
+    env:
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
     defaults:
       run:
-        working-directory: environments/${{ matrix.env }}
+        working-directory: environments/dev
     steps:
       - uses: actions/checkout@v4
 
@@ -82,52 +123,53 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ matrix.region }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Diagnostics
+        run: |
+          echo "===== ENVIRONMENT ====="
+          echo "Dev"
+          echo "===== STAGE ====="
+          echo "dev-plan"
+          echo "===== AWS REGION ====="
+          echo "$AWS_REGION"
+          echo "===== BACKEND ====="
+          echo "bucket=$STATE_BUCKET key=dev/terraform.tfstate region=$STATE_REGION"
+          echo "===== TERRAFORM VERSION ====="
+          terraform version
+          echo "===== WORKING DIRECTORY ====="
+          pwd
 
       - name: Download init artifact
         uses: actions/download-artifact@v4
         with:
-          name: init-${{ matrix.env }}
-          path: environments/${{ matrix.env }}
+          name: dev-init
+          path: environments/dev
 
       - name: Restore initialized working directory
         run: tar -xf init.tar
 
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
-
-      - name: Terraform Validate
-        run: terraform validate
-
       - name: Terraform Plan
         run: terraform plan -input=false -out=tfplan
-
-      - name: Package plan
-        run: tar -cf plan.tar tfplan
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
         with:
-          name: plan-${{ matrix.env }}
-          path: environments/${{ matrix.env }}/plan.tar
+          name: dev-tfplan
+          path: environments/dev/tfplan
           retention-days: 1
 
-  terraform-apply:
-    name: terraform-apply (${{ matrix.env }})
-    needs: terraform-plan
+  dev-apply:
+    name: dev-apply
+    needs: dev-plan
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 1
-      matrix:
-        include:
-          - env: dev
-            region: us-east-1
-          - env: test
-            region: eu-west-1
+    env:
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
     defaults:
       run:
-        working-directory: environments/${{ matrix.env }}
+        working-directory: environments/dev
     steps:
       - uses: actions/checkout@v4
 
@@ -137,24 +179,200 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ matrix.region }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Diagnostics
+        run: |
+          echo "===== ENVIRONMENT ====="
+          echo "Dev"
+          echo "===== STAGE ====="
+          echo "dev-apply"
+          echo "===== AWS REGION ====="
+          echo "$AWS_REGION"
+          echo "===== BACKEND ====="
+          echo "bucket=$STATE_BUCKET key=dev/terraform.tfstate region=$STATE_REGION"
+          echo "===== TERRAFORM VERSION ====="
+          terraform version
+          echo "===== WORKING DIRECTORY ====="
+          pwd
 
       - name: Download init artifact
         uses: actions/download-artifact@v4
         with:
-          name: init-${{ matrix.env }}
-          path: environments/${{ matrix.env }}
+          name: dev-init
+          path: environments/dev
 
       - name: Download plan artifact
         uses: actions/download-artifact@v4
         with:
-          name: plan-${{ matrix.env }}
-          path: environments/${{ matrix.env }}
+          name: dev-tfplan
+          path: environments/dev
 
-      - name: Restore initialized working directory and plan
+      - name: Restore initialized working directory
+        run: tar -xf init.tar
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false tfplan
+
+  test-init:
+    name: test-init
+    needs: dev-apply
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: eu-west-1
+      AWS_DEFAULT_REGION: eu-west-1
+    defaults:
+      run:
+        working-directory: environments/test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Diagnostics
         run: |
-          tar -xf init.tar
-          tar -xf plan.tar
+          echo "===== ENVIRONMENT ====="
+          echo "Test"
+          echo "===== STAGE ====="
+          echo "test-init"
+          echo "===== AWS REGION ====="
+          echo "$AWS_REGION"
+          echo "===== BACKEND ====="
+          echo "bucket=$STATE_BUCKET key=test/terraform.tfstate region=$STATE_REGION"
+          echo "===== TERRAFORM VERSION ====="
+          terraform version
+          echo "===== WORKING DIRECTORY ====="
+          pwd
+
+      - name: Terraform Init
+        run: >
+          terraform init -input=false
+          -backend-config="bucket=${STATE_BUCKET}"
+          -backend-config="key=test/terraform.tfstate"
+          -backend-config="region=${STATE_REGION}"
+
+      # tar keeps the provider binaries' executable bit, which artifact zips drop
+      - name: Package initialized working directory
+        run: tar -cf init.tar .terraform .terraform.lock.hcl
+
+      - name: Upload init artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-init
+          path: environments/test/init.tar
+          retention-days: 1
+
+  test-plan:
+    name: test-plan
+    needs: test-init
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: eu-west-1
+      AWS_DEFAULT_REGION: eu-west-1
+    defaults:
+      run:
+        working-directory: environments/test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Diagnostics
+        run: |
+          echo "===== ENVIRONMENT ====="
+          echo "Test"
+          echo "===== STAGE ====="
+          echo "test-plan"
+          echo "===== AWS REGION ====="
+          echo "$AWS_REGION"
+          echo "===== BACKEND ====="
+          echo "bucket=$STATE_BUCKET key=test/terraform.tfstate region=$STATE_REGION"
+          echo "===== TERRAFORM VERSION ====="
+          terraform version
+          echo "===== WORKING DIRECTORY ====="
+          pwd
+
+      - name: Download init artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: test-init
+          path: environments/test
+
+      - name: Restore initialized working directory
+        run: tar -xf init.tar
+
+      - name: Terraform Plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-tfplan
+          path: environments/test/tfplan
+          retention-days: 1
+
+  test-apply:
+    name: test-apply
+    needs: test-plan
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: eu-west-1
+      AWS_DEFAULT_REGION: eu-west-1
+    defaults:
+      run:
+        working-directory: environments/test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Diagnostics
+        run: |
+          echo "===== ENVIRONMENT ====="
+          echo "Test"
+          echo "===== STAGE ====="
+          echo "test-apply"
+          echo "===== AWS REGION ====="
+          echo "$AWS_REGION"
+          echo "===== BACKEND ====="
+          echo "bucket=$STATE_BUCKET key=test/terraform.tfstate region=$STATE_REGION"
+          echo "===== TERRAFORM VERSION ====="
+          terraform version
+          echo "===== WORKING DIRECTORY ====="
+          pwd
+
+      - name: Download init artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: test-init
+          path: environments/test
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: test-tfplan
+          path: environments/test
+
+      - name: Restore initialized working directory
+        run: tar -xf init.tar
 
       - name: Terraform Apply
         run: terraform apply -auto-approve -input=false tfplan
