@@ -39,14 +39,18 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ matrix.region }}
 
-      - run: terraform fmt -check -recursive
-      - run: >
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+      - name: Terraform Init
+        run: >
           terraform init -input=false
           -backend-config="bucket=${STATE_BUCKET}"
           -backend-config="key=${{ matrix.env }}/terraform.tfstate"
           -backend-config="region=${STATE_REGION}"
-      - run: terraform validate
-      - run: terraform plan -input=false
+      - name: Terraform Validate
+        run: terraform validate
+      - name: Terraform Plan
+        run: terraform plan -input=false
 
   apply:
     name: Apply (${{ matrix.env }})
@@ -75,9 +79,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ matrix.region }}
 
-      - run: >
+      - name: Terraform Init
+        run: >
           terraform init -input=false
           -backend-config="bucket=${STATE_BUCKET}"
           -backend-config="key=${{ matrix.env }}/terraform.tfstate"
           -backend-config="region=${STATE_REGION}"
-      - run: terraform apply -auto-approve -input=false
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false
