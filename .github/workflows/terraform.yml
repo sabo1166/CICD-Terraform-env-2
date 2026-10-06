@@ -15,8 +15,8 @@ env:
   STATE_REGION: us-east-1
 
 jobs:
-  plan:
-    name: Plan (${{ matrix.env }})
+  terraform-init:
+    name: terraform-init (${{ matrix.env }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -40,22 +40,81 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ matrix.region }}
 
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
       - name: Terraform Init
         run: >
           terraform init -input=false
           -backend-config="bucket=${STATE_BUCKET}"
           -backend-config="key=${{ matrix.env }}/terraform.tfstate"
           -backend-config="region=${STATE_REGION}"
+
+      # tar keeps the provider binaries' executable bit, which artifact zips drop
+      - name: Package initialized working directory
+        run: tar -cf init.tar .terraform .terraform.lock.hcl
+
+      - name: Upload init artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: init-${{ matrix.env }}
+          path: environments/${{ matrix.env }}/init.tar
+          retention-days: 1
+
+  terraform-plan:
+    name: terraform-plan (${{ matrix.env }})
+    needs: terraform-init
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            region: us-east-1
+          - env: test
+            region: eu-west-1
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Download init artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: init-${{ matrix.env }}
+          path: environments/${{ matrix.env }}
+
+      - name: Restore initialized working directory
+        run: tar -xf init.tar
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
       - name: Terraform Validate
         run: terraform validate
-      - name: Terraform Plan
-        run: terraform plan -input=false
 
-  apply:
-    name: Apply (${{ matrix.env }})
-    needs: plan
+      - name: Terraform Plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Package plan
+        run: tar -cf plan.tar tfplan
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ matrix.env }}
+          path: environments/${{ matrix.env }}/plan.tar
+          retention-days: 1
+
+  terraform-apply:
+    name: terraform-apply (${{ matrix.env }})
+    needs: terraform-plan
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     strategy:
@@ -80,11 +139,22 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ matrix.region }}
 
-      - name: Terraform Init
-        run: >
-          terraform init -input=false
-          -backend-config="bucket=${STATE_BUCKET}"
-          -backend-config="key=${{ matrix.env }}/terraform.tfstate"
-          -backend-config="region=${STATE_REGION}"
+      - name: Download init artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: init-${{ matrix.env }}
+          path: environments/${{ matrix.env }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plan-${{ matrix.env }}
+          path: environments/${{ matrix.env }}
+
+      - name: Restore initialized working directory and plan
+        run: |
+          tar -xf init.tar
+          tar -xf plan.tar
+
       - name: Terraform Apply
-        run: terraform apply -auto-approve -input=false
+        run: terraform apply -auto-approve -input=false tfplan
