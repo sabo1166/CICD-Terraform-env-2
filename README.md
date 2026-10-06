@@ -20,11 +20,10 @@ Reusable modules · environment separation · remote state with S3-native lockin
                                          |
                              OIDC token (short-lived)
                                          |
+                        existing IAM role: GitHub-OIDC
+                        (created outside this repo)
+                                         |
                     +--------------------+--------------------+
-                    | role: github-plan  |                    |
-                    | (read-only, PRs)   |                    |
-              role: github-apply-dev           role: github-apply-prod
-              (env "dev" only)                 (env "prod" only)
                     |                                         |
                     v                                         v
         state: s3://<bucket>/dev/...              state: s3://<bucket>/prod/...
@@ -43,10 +42,10 @@ Reusable modules · environment separation · remote state with S3-native lockin
 | Flow-log retention | 14 days | 90 days |
 | State key | `dev/terraform.tfstate` | `prod/terraform.tfstate` |
 | Deploy | automatic on merge to `main` | after required-reviewer approval |
-| AWS role | `foundation-github-apply-dev` | `foundation-github-apply-prod` |
+| AWS role (OIDC) | existing `GitHub-OIDC` (shared) | existing `GitHub-OIDC` (shared) |
 | Provider | own `provider "aws"` + `default_tags` (Environment=dev) | own `provider "aws"` + `default_tags` (Environment=prod) |
 
-Separation is by **state, CIDR, IAM role, provider and name prefix** (`foundation-dev-*` / `foundation-prod-*`) within one AWS account. For stronger isolation use one AWS account per environment (see §14).
+Separation is by **state, CIDR, provider and name prefix** (`foundation-dev-*` / `foundation-prod-*`) within one AWS account. For stronger isolation use one AWS account per environment (see §14).
 
 ## 4. VPC design
 
@@ -65,7 +64,8 @@ Why each piece: the **NAT Gateway** gives private subnets controlled outbound ac
 ```text
 .github/workflows/terraform.yml       entry: validate, then dev, then prod
 .github/workflows/terraform-env.yml   reusable: plan (+ apply) one environment
-bootstrap/                            state bucket + OIDC provider + IAM roles (local state, run once)
+bootstrap/                            state bucket only (local state, run once). No OIDC/IAM here.
+docs/github-oidc-role.md              trust + permission requirements of the existing GitHub-OIDC role
 environments/{dev,prod}/              thin roots: backend, provider, one module call, outputs
 modules/foundation/                   composes the three modules below (+ flow-log log group)
 modules/vpc/                          VPC, subnets, IGW, NAT, routes, S3 endpoint, flow log
@@ -77,37 +77,33 @@ No resource is defined twice: each environment only calls `modules/foundation` w
 
 ## 6. State management
 - **Remote backend:** S3 bucket `foundation-tfstate-<account-id>` (SSE-S3, versioned, public access blocked, ACLs disabled, TLS-only, `prevent_destroy`).
-- **Separation:** `dev/terraform.tfstate` and `prod/terraform.tfstate` — independent states; apply roles can only access their own prefix.
+- **Separation:** `dev/terraform.tfstate` and `prod/terraform.tfstate` — independent states. (The shared `GitHub-OIDC` role can reach both prefixes; scope its policy as in `docs/github-oidc-role.md`.)
 - **Locking:** S3-native (`use_lockfile = true`, Terraform ≥ 1.10): Terraform writes `<key>.tflock` with a conditional write, so two concurrent runs can't both hold it. **No DynamoDB table is needed.**
 - **Partial backend config:** `backend.tf` holds the key; `bucket` and `region` are passed with `-backend-config` so the account ID is never committed.
 - **Chicken-and-egg:** `bootstrap/` creates the bucket using *local* state, then everything else uses the bucket.
 - **If the bucket is deleted:** versioning lets you restore deleted state objects (undelete the delete markers) while the bucket exists. If the bucket itself is gone, state is lost: recreate the bucket (`bootstrap`), then `terraform import` each resource, or destroy leftovers by tag (`ManagedBy=terraform`). `prevent_destroy` guards against accidental `terraform destroy` of the bootstrap.
 
 ## 7. GitHub Actions pipeline
-- **Pull request** → `validate` job (fmt -check, backend-less init + validate for both envs, module tests) → `plan` dev and prod via the read-only plan role. Plans appear in the run summary. Nothing is applied.
+- **Pull request** → `validate` job (fmt -check, backend-less init + validate for both envs, module tests) → `plan` dev and prod using the `GitHub-OIDC` role. Plans appear in the run summary. Nothing is applied.
 - **Push to `main`** → validate → plan dev → **apply dev** (environment `dev`) → plan prod → **apply prod** (environment `prod`, pauses for approval). Apply uses the exact saved plan file.
 - Least-privilege `permissions` (`contents: read`, `id-token: write` only on AWS jobs); apply jobs are serialised per environment and never cancelled mid-run.
 
 ## 8. GitHub OIDC
-1. `bootstrap/` creates the `token.actions.githubusercontent.com` identity provider and three roles (plan, apply-dev, apply-prod).
-2. Each trust policy requires `aud = sts.amazonaws.com` and an exact `sub`: plan role → `repo:sabo1166/CICD-terraform-project-2-env:pull_request` / `:ref:refs/heads/main`; apply roles → `repo:sabo1166/CICD-terraform-project-2-env:environment:<env>`.
-3. Workflows call `aws-actions/configure-aws-credentials` with `role-to-assume`; no secrets involved.
+The OIDC provider (`token.actions.githubusercontent.com`, audience `sts.amazonaws.com`) and the IAM role `arn:aws:iam::868713841842:role/GitHub-OIDC` **already exist and are managed outside this repository**. Terraform here never creates, changes or replaces them.
+
+1. Workflows request an OIDC token (`permissions: id-token: write`) and call `aws-actions/configure-aws-credentials@v4` with `role-to-assume: arn:aws:iam::868713841842:role/GitHub-OIDC`, `aws-region: us-east-1`. No AWS keys or tokens are stored in GitHub.
+2. Dev and prod share this one role.
+3. **The role's trust policy must allow four subjects**, not just `ref:refs/heads/main`: `pull_request`, `ref:refs/heads/main`, `environment:dev` and `environment:prod`. A job with `environment:` (needed for the prod approval gate) sends the `environment:` subject instead of the branch subject, so a `main`-only trust policy would make the apply jobs fail with `AssumeRoleWithWebIdentity` errors. The exact JSON, required permissions and the security trade-off of a shared role are in [docs/github-oidc-role.md](docs/github-oidc-role.md). **The real role's policies have not been inspected yet** (no valid AWS credentials were available).
 
 ## 9. Required AWS / GitHub configuration
-**AWS (once, by a human with admin-ish rights):**
+**AWS:**
+1. Verify the existing role's trust policy and permissions against [docs/github-oidc-role.md](docs/github-oidc-role.md) and update the role if needed (your change; this repo doesn't touch it).
+2. Create the state bucket once (S3 only, no IAM/OIDC):
 ```bash
-aws sts get-caller-identity            # confirm the right account
-scripts/bootstrap-state.sh             # add -var=create_oidc_provider=false if the account already has a GitHub OIDC provider
+aws sts get-caller-identity            # must show account 868713841842
+scripts/bootstrap-state.sh
 ```
-**GitHub** (Settings → Secrets and variables → Actions → *Variables*):
-
-| Scope | Variable | Value (from `terraform output` in `bootstrap/`) |
-|---|---|---|
-| Repository | `AWS_REGION` | `us-east-1` |
-| Repository | `TF_STATE_BUCKET` | `state_bucket_name` |
-| Repository | `AWS_PLAN_ROLE_ARN` | `plan_role_arn` |
-| Environment `dev` | `AWS_APPLY_ROLE_ARN` | `apply_role_arns.dev` |
-| Environment `prod` | `AWS_APPLY_ROLE_ARN` | `apply_role_arns.prod` |
+**GitHub:** no repository variables or secrets are required. Role ARN, region and the state bucket name (`foundation-tfstate-868713841842`, produced by the bootstrap) are set in `.github/workflows/terraform-env.yml`; none are secret.
 
 **Environments / approval gate** (Settings → Environments):
 1. Create `dev` (no protection).
@@ -151,18 +147,18 @@ See [SECURITY.md](SECURITY.md): OIDC with repo/environment-pinned roles, separat
 - **To keep a portfolio run cheap, apply, verify, then destroy.**
 
 ## 14. Production considerations
-Ready: modular design, remote state with locking, OIDC, per-env roles, approval gate, tests. Further hardening for a larger organisation: one AWS account per environment (with a Terraform-managed org baseline), permissions boundary on the apply roles, KMS CMKs for state/logs, state-bucket access logging and replication, SHA-pinned Actions, policy-as-code (tflint/tfsec/checkov in CI), drift detection, alarms on flow logs/NAT, VPC interface endpoints instead of NAT for AWS APIs.
+Ready: modular design, remote state with locking, OIDC, approval gate, tests. Further hardening for a larger organisation: separate read-only plan and per-environment apply roles instead of one shared role (see `docs/github-oidc-role.md`), one AWS account per environment, a permissions boundary on the deploy role, KMS CMKs for state/logs, state-bucket access logging and replication, SHA-pinned Actions, policy-as-code (tflint/tfsec/checkov in CI), drift detection, alarms on flow logs/NAT, VPC interface endpoints instead of NAT for AWS APIs.
 
 ## 15. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Trust `sub` mismatch: job isn't in the expected environment/branch, repo name differs, or the role ARN variable is wrong. Check the `sub` in the OIDC claim vs. the role trust policy. |
-| `Credentials could not be loaded` in Actions | Missing `permissions: id-token: write` on the job, or `AWS_*_ROLE_ARN` variable unset (empty). |
-| `AccessDenied` for an `ec2:`/`logs:`/`iam:` action during apply | The apply policy in `bootstrap/main.tf` lacks that action (policies are least-privilege and were not yet exercised on a live account). Add it, re-run bootstrap. |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Trust `sub` mismatch. Most likely the trust policy only allows `ref:refs/heads/main` while the job runs with `environment:` (sub = `...:environment:prod`) or on a pull request (`...:pull_request`). Add the four subjects in `docs/github-oidc-role.md`. |
+| `Credentials could not be loaded` in Actions | Missing `permissions: id-token: write` on the job (or on the caller of the reusable workflow). |
+| `AccessDenied` for an `s3:`/`ec2:`/`logs:`/`iam:` action | The permission policy of the `GitHub-OIDC` role lacks that action (see `docs/github-oidc-role.md`). Update the role; it is not managed here. |
 | `Error acquiring the state lock` | Another run holds `<key>.tflock`; wait, or after confirming nothing is running `terraform force-unlock <id>`. |
 | `Backend configuration changed` / bucket empty | `terraform init` without `-backend-config`, or wrong bucket. Pass bucket and region. |
-| `BucketAlreadyOwnedByYou` / OIDC `EntityAlreadyExists` in bootstrap | Provider already exists in the account: re-run with `-var=create_oidc_provider=false`. |
+| `BucketAlreadyOwnedByYou` in bootstrap | The state bucket already exists; import it (`terraform import aws_s3_bucket.state <name>`) instead of recreating. |
 | `The security token included in the request is invalid` locally | Stale/invalid local AWS credentials; run `aws sts get-caller-identity` and fix the profile. |
 | `Unsupported argument use_lockfile` | Terraform < 1.10. Upgrade. |
 
@@ -176,10 +172,11 @@ Recorded 2026-10-06 on Terraform 1.16.2, AWS provider 6.67.0 (locked), Windows 1
 | `terraform test` (mocked provider): vpc 5/5, security-groups 4/4, foundation 3/3 | PASS (12/12) |
 | Provider lock files (linux_amd64, windows_amd64, darwin_arm64, darwin_amd64) for dev, prod, bootstrap | PASS |
 | `terraform plan` against AWS (dev/prod) | **NOT RUN**: the AWS credentials available locally were rejected (`InvalidClientTokenId`) and the state bucket does not exist yet |
-| Bootstrap apply (state bucket, OIDC provider, roles) | **NOT RUN**: needs valid AWS credentials |
+| Bootstrap apply (state bucket) | **NOT RUN**: needs valid AWS credentials |
+| Existing `GitHub-OIDC` role trust/permissions inspected | **NOT DONE**: `aws iam get-role` failed with `InvalidClientTokenId`. Requirements are documented in `docs/github-oidc-role.md`; the real role must be compared against them |
 | AWS resource verification (VPC, subnets, NAT, SGs, roles, tags) | **NOT DONE**: nothing has been deployed |
 | GitHub Actions run | **NOT RUN**: workflows are committed but have never executed; their YAML was reviewed by hand, not machine-validated (no YAML linter available locally) |
-| GitHub Environments / approval gate / repository variables | **NOT CONFIGURED**: manual steps in §9 |
+| GitHub Environments / approval gate | **NOT CONFIGURED**: manual steps in §9 |
 | tflint / tfsec / checkov | **NOT RUN**: not installed (not installed automatically) |
 
-Expected first-run work: the least-privilege apply policies have never been exercised against a live account, so the first apply may reveal a missing IAM action (see Troubleshooting).
+Expected first-run work: the trust policy likely needs the `environment:` and `pull_request` subjects, and the role's permissions have never been exercised with this Terraform (see Troubleshooting).

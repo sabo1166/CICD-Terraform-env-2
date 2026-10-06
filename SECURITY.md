@@ -4,19 +4,16 @@
 Open a private security advisory on the repository (Security tab > Report a vulnerability). Do not post secrets or exploits in public issues.
 
 ## Authentication: GitHub OIDC, no stored keys
-GitHub Actions exchanges a short-lived OIDC token for temporary AWS credentials (`aws-actions/configure-aws-credentials`). **No `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` exist anywhere in GitHub.** The only repository/environment *variables* are non-secret identifiers (role ARNs, bucket name, region).
+GitHub Actions exchanges a short-lived OIDC token for temporary AWS credentials (`aws-actions/configure-aws-credentials@v4`). **No `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or `AWS_SESSION_TOKEN` exist anywhere in GitHub or in this repository.**
 
-| Role | Assumed by (OIDC `sub`) | Can do |
-|---|---|---|
-| `foundation-github-plan` | `repo:sabo1166/CICD-terraform-project-2-env:pull_request` and `:ref:refs/heads/main` | Read-only describe calls; read state; create/delete only `*/terraform.tfstate.tflock` |
-| `foundation-github-apply-dev` | `repo:sabo1166/CICD-terraform-project-2-env:environment:dev` | Manage dev network resources, `dev/*` state only |
-| `foundation-github-apply-prod` | `repo:sabo1166/CICD-terraform-project-2-env:environment:prod` | Manage prod network resources, `prod/*` state only |
+The OIDC provider and the role `arn:aws:iam::868713841842:role/GitHub-OIDC` were created manually and are an **external dependency**; this repository does not create or manage them. Dev and prod share that role. Requirements for its trust policy (exact repository, `aud = sts.amazonaws.com`, the four allowed `sub` values) and permissions are in [docs/github-oidc-role.md](docs/github-oidc-role.md). The real role has not yet been inspected from this project.
 
-Every trust policy pins the audience (`sts.amazonaws.com`) and the exact repository. The prod role can only be assumed by a job running in the `prod` GitHub Environment, i.e. after required reviewers approved it. A compromised dev job cannot touch prod state or resources. Pull requests from forks receive no OIDC token.
+## Shared-role risk (important)
+Because one role serves pull-request plans and production applies, anything that can obtain a `pull_request` token for this repository (anyone who can open a PR from a branch in it) can run Terraform with that role's permissions, including via a modified workflow. The prod approval gate protects `environment: prod` jobs, not an arbitrary PR job using the same role. Recommended: split into a read-only plan role and environment-scoped apply roles, and meanwhile restrict who can open PRs and require approval for workflow runs.
 
 ## Terraform state
 - One S3 bucket, `foundation-tfstate-<account-id>`: SSE-S3 encryption, versioning, all public access blocked, ACLs disabled (`BucketOwnerEnforced`), TLS-only bucket policy, `prevent_destroy`.
-- Separate keys: `dev/terraform.tfstate`, `prod/terraform.tfstate`. Apply roles are limited to their own prefix.
+- Separate keys: `dev/terraform.tfstate`, `prod/terraform.tfstate`; S3-native locking.
 - State is never stored in Git (`.gitignore` blocks `*.tfstate*`, `*.tfvars`, plan files).
 
 ## Network
@@ -26,8 +23,8 @@ Every trust policy pins the audience (`sts.amazonaws.com`) and the exact reposit
 - The only broad rule is app egress 443 to `0.0.0.0/0` through NAT (no stable destination CIDRs); documented in code.
 
 ## Known limitations (hardening for a larger organization)
-- The apply roles can create IAM roles/inline policies named `foundation-<env>-*`, which is a privilege-escalation path. Add a permissions boundary or move IAM changes to a separate pipeline.
+- Shared plan/apply role (above); no permissions boundary.
 - State and flow logs use AWS-managed encryption (SSE-S3 / CloudWatch default), not customer-managed KMS keys.
 - Third-party Actions are pinned to major version tags, not commit SHAs.
 - No state-bucket access logging, no cross-region replication, no SCPs, no GuardDuty/Config.
-- Role permissions were written from the Terraform provider's API usage and have **not** been exercised against a live account yet; expect to add a missing action on first apply.
+- Never run against a live account yet; expect to adjust role permissions on first apply.
