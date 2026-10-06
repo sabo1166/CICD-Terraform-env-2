@@ -45,6 +45,24 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
+      # TEMPORARY diagnostic (remove once the trust policy is fixed): shows which
+      # OIDC claims this job presents. Requests the same token the AWS action
+      # would, masks it, and prints only non-secret claims. No AWS call is made.
+      - name: "Diagnostic: OIDC claims (token is never printed)"
+        run: |
+          set -euo pipefail
+          token=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value')
+          echo "::add-mask::${token}"
+          payload=$(printf '%s' "${token}" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          claims=$(printf '%s' "${payload}" | base64 -d | jq -c '{iss, aud, sub, repository, ref, event_name, environment: (.environment // "none"), job_workflow_ref}')
+          echo "${claims}" | jq .
+          echo "::notice title=OIDC sub::$(echo "${claims}" | jq -r .sub)"
+          echo "::notice title=OIDC aud::$(echo "${claims}" | jq -r .aud)"
+          echo "::notice title=OIDC environment claim::$(echo "${claims}" | jq -r .environment)"
+          echo "::notice title=OIDC ref and event::$(echo "${claims}" | jq -r '.ref + " / " + .event_name')"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
