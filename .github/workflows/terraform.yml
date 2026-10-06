@@ -1,0 +1,76 @@
+name: terraform
+
+# PR:   validate, then plan dev and prod. Nothing is applied.
+# main: validate, plan dev -> apply dev -> plan prod -> (approval) -> apply prod.
+on:
+  pull_request:
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/**"
+  push:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: fmt / validate / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.2"
+          terraform_wrapper: false
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      # Backend-less init: syntax and module wiring only, no AWS access needed.
+      - name: Terraform init + validate (dev, prod)
+        run: |
+          for env in dev prod; do
+            echo "::group::$env"
+            terraform -chdir=environments/$env init -backend=false -input=false
+            terraform -chdir=environments/$env validate
+            echo "::endgroup::"
+          done
+
+      - name: Module tests (mocked provider, no AWS)
+        run: |
+          for m in vpc security-groups foundation; do
+            echo "::group::$m"
+            terraform -chdir=modules/$m init -backend=false -input=false
+            terraform -chdir=modules/$m test
+            echo "::endgroup::"
+          done
+
+  dev:
+    needs: validate
+    uses: ./.github/workflows/terraform-env.yml
+    with:
+      environment: dev
+      apply: ${{ github.event_name == 'push' }}
+    permissions:
+      id-token: write
+      contents: read
+
+  prod:
+    # On PRs, plan prod even if the dev plan failed so both results are visible.
+    # On main, only proceed once dev has been applied successfully.
+    needs: [validate, dev]
+    if: ${{ !cancelled() && needs.validate.result == 'success' && (github.event_name == 'pull_request' || needs.dev.result == 'success') }}
+    uses: ./.github/workflows/terraform-env.yml
+    with:
+      environment: prod
+      apply: ${{ github.event_name == 'push' }}
+    permissions:
+      id-token: write
+      contents: read
