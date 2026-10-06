@@ -1,76 +1,83 @@
-name: terraform
+name: deploy-terrafrom-task
 
-# PR:   validate, then plan dev and prod. Nothing is applied.
-# main: validate, plan dev -> apply dev -> plan prod -> (approval) -> apply prod.
 on:
-  pull_request:
-    paths:
-      - "environments/**"
-      - "modules/**"
-      - ".github/workflows/**"
   push:
     branches: [main]
-    paths:
-      - "environments/**"
-      - "modules/**"
-      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
+  id-token: write
+
+env:
+  AWS_ROLE_ARN: arn:aws:iam::943812324876:role/Gitaction
+  STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  STATE_REGION: us-east-1
 
 jobs:
-  validate:
-    name: fmt / validate / test
+  plan:
+    name: Plan (${{ matrix.env }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            region: us-east-1
+          - env: test
+            region: eu-west-1
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.env }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: hashicorp/setup-terraform@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          terraform_version: "1.16.2"
-          terraform_wrapper: false
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
 
-      - name: Terraform fmt
-        run: terraform fmt -check -recursive -diff
+      - run: terraform fmt -check -recursive
+      - run: >
+          terraform init -input=false
+          -backend-config="bucket=${STATE_BUCKET}"
+          -backend-config="key=${{ matrix.env }}/terraform.tfstate"
+          -backend-config="region=${STATE_REGION}"
+      - run: terraform validate
+      - run: terraform plan -input=false
 
-      # Backend-less init: syntax and module wiring only, no AWS access needed.
-      - name: Terraform init + validate (dev, prod)
-        run: |
-          for env in dev prod; do
-            echo "::group::$env"
-            terraform -chdir=environments/$env init -backend=false -input=false
-            terraform -chdir=environments/$env validate
-            echo "::endgroup::"
-          done
+  apply:
+    name: Apply (${{ matrix.env }})
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - env: dev
+            region: us-east-1
+          - env: test
+            region: eu-west-1
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Module tests (mocked provider, no AWS)
-        run: |
-          for m in vpc security-groups foundation; do
-            echo "::group::$m"
-            terraform -chdir=modules/$m init -backend=false -input=false
-            terraform -chdir=modules/$m test
-            echo "::endgroup::"
-          done
+      - uses: hashicorp/setup-terraform@v3
 
-  dev:
-    needs: validate
-    uses: ./.github/workflows/terraform-env.yml
-    with:
-      environment: dev
-      apply: ${{ github.event_name == 'push' }}
-    permissions:
-      id-token: write
-      contents: read
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
 
-  prod:
-    # On PRs, plan prod even if the dev plan failed so both results are visible.
-    # On main, only proceed once dev has been applied successfully.
-    needs: [validate, dev]
-    if: ${{ !cancelled() && needs.validate.result == 'success' && (github.event_name == 'pull_request' || needs.dev.result == 'success') }}
-    uses: ./.github/workflows/terraform-env.yml
-    with:
-      environment: prod
-      apply: ${{ github.event_name == 'push' }}
-    permissions:
-      id-token: write
-      contents: read
+      - run: >
+          terraform init -input=false
+          -backend-config="bucket=${STATE_BUCKET}"
+          -backend-config="key=${{ matrix.env }}/terraform.tfstate"
+          -backend-config="region=${STATE_REGION}"
+      - run: terraform apply -auto-approve -input=false

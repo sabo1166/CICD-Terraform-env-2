@@ -1,7 +1,7 @@
 module "vpc" {
   source = "../../modules/vpc"
 
-  name               = "dev"
+  name               = "test"
   vpc_cidr           = var.vpc_cidr
   public_subnet_cidr = var.public_subnet_cidr
 }
@@ -9,7 +9,7 @@ module "vpc" {
 module "ec2" {
   source = "../../modules/ec2"
 
-  name          = "dev"
+  name          = "test"
   vpc_id        = module.vpc.vpc_id
   subnet_id     = module.vpc.public_subnet_id
   instance_type = var.instance_type
