@@ -18,9 +18,8 @@ GitHub repo variables:
 
 - `TF_STATE_BUCKET` – existing S3 bucket for Terraform state
 
-The workflow authenticates via GitHub OIDC by assuming
-`arn:aws:iam::943812324876:role/Gitaction`. The role's trust policy must allow this
-repository, and the role needs access to the state bucket and EC2/VPC permissions in both regions.
+The workflow authenticates with the repo secrets `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+The IAM user needs access to the state bucket and EC2/VPC permissions in both regions.
 
 Local use:
 
